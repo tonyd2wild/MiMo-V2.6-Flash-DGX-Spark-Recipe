@@ -126,10 +126,15 @@ function forward(req, res, target, body, route = {}) {
     const toolCap = route.toolCap === undefined ? 6 : route.toolCap
     const sse = toolCap > 0 && String(ur.headers['content-type'] || '').startsWith('text/event-stream')
     if (!sse) { ur.pipe(res); return }
+    // A multi-byte UTF-8 character can arrive split across two network reads.
+    // Decoding each chunk on its own turns both halves into U+FFFD while the SSE
+    // and JSON stay valid, so a tool call silently gets the wrong path or text.
+    // setEncoding keeps the partial bytes until the rest of the character arrives.
+    ur.setEncoding('utf8')
     const seen = new Set(); let buf = ''; let tripped = false; let ended = false; let lastId = null
     ur.on('data', (chunk) => {
       if (tripped) return
-      buf += chunk.toString('utf8')
+      buf += chunk
       let nl
       while ((nl = buf.indexOf('\n\n')) >= 0) {
         const evt = buf.slice(0, nl + 2); buf = buf.slice(nl + 2)
