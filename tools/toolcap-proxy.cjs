@@ -35,10 +35,12 @@ const http = require('http')
 const https = require('https')
 const fs = require('fs')
 const path = require('path')
+const { StringDecoder } = require('string_decoder')
 
 const HOST = '127.0.0.1' // loopback only; the harness is the only client
 const PORT = Number(process.env.IMAGE_CAP_PORT || 8905)
 const MAX_BODY = 256 * 1024 * 1024 // images arrive base64-inlined
+const MAX_SSE_EVENT_CHARS = 8 * 1024 * 1024 // bound an unfinished event, not the response length
 const LOG_FILE = path.join(__dirname, 'proxy.log')
 const ROUTES = JSON.parse(fs.readFileSync(path.join(__dirname, 'routes.json'), 'utf8')).routes
 
@@ -92,10 +94,61 @@ function capImages(messages, max) {
   return { total: refs.length, removed: excess }
 }
 
+// SSE line rules: https://html.spec.whatwg.org/multipage/server-sent-events.html#event-stream-interpretation
+// Normalize line endings, preserving every field. Only data fields form the JSON payload.
+async function* sseEvents(stream) {
+  const decoder = new StringDecoder('utf8')
+  let first = true; let skipLF = false; let line = ''; let lines = []; let data = []; let size = 0
+  for await (const chunk of stream) {
+    let text = typeof chunk === 'string' ? chunk : decoder.write(chunk)
+    if (!text) continue
+    if (first) { first = false; text = text.replace(/^\uFEFF/, '') }
+    if (skipLF) text = text.replace(/^\n/, '')
+    skipLF = text.endsWith('\r')
+    const parts = text.replace(/\r\n|\r/g, '\n').split('\n')
+    for (let i = 0; i < parts.length; i++) {
+      const ended = i < parts.length - 1
+      size += parts[i].length + (ended ? 1 : 0)
+      if (size > MAX_SSE_EVENT_CHARS) throw new Error('upstream SSE event exceeds the size limit')
+      line += parts[i]
+      if (!ended) continue
+      lines.push(line + '\n')
+      if (line === '') {
+        yield { raw: lines.join(''), data: data.join('\n') }
+        lines = []; data = []; size = 0
+      } else if (line === 'data') data.push('')
+      else if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''))
+      line = ''
+    }
+  }
+  // Never turn a truncated data event into a successful completion. Trailing
+  // comments/metadata without a data field are discarded, as SSE specifies.
+  if (decoder.end() || data.length || line === 'data' || line.startsWith('data:')) {
+    throw new Error('upstream ended with an incomplete SSE event')
+  }
+}
+
+async function writeSse(res, text) {
+  if (res.destroyed) return false
+  if (!res.write(text)) {
+    await new Promise((resolve) => {
+      const ready = () => {
+        res.off('drain', ready); res.off('close', ready); res.off('error', ready)
+        resolve()
+      }
+      res.once('drain', ready); res.once('close', ready); res.once('error', ready)
+      if (res.destroyed) ready()
+    })
+  }
+  return !res.destroyed
+}
+
 function forward(req, res, target, body, route = {}) {
   const headers = { ...req.headers }
   for (const h of ['host', 'connection', 'keep-alive', 'transfer-encoding', 'content-length']) delete headers[h]
   if (body.length || req.method === 'POST') headers['content-length'] = String(body.length)
+  // The cap must inspect the decoded SSE. Do not advertise encodings we cannot inspect.
+  if (route.toolCap === undefined || route.toolCap > 0) headers['accept-encoding'] = 'identity'
 
   const lib = target.protocol === 'https:' ? https : http
   const up = lib.request({
@@ -109,7 +162,6 @@ function forward(req, res, target, body, route = {}) {
   }, (ur) => {
     const out = { ...ur.headers }
     for (const h of ['connection', 'keep-alive', 'transfer-encoding']) delete out[h]
-    res.writeHead(ur.statusCode || 502, out)
     // An upstream that drops MID-RESPONSE (the tailnet going away does exactly
     // this) makes `ur` emit 'error'. pipe() does not forward it, and an
     // unhandled stream error kills the whole process -- every route with it.
@@ -125,34 +177,45 @@ function forward(req, res, target, body, route = {}) {
     // asks again with real results. Route option toolCap (default 6, 0 = off).
     const toolCap = route.toolCap === undefined ? 6 : route.toolCap
     const sse = toolCap > 0 && String(ur.headers['content-type'] || '').startsWith('text/event-stream')
-    if (!sse) { ur.pipe(res); return }
-    const seen = new Set(); let buf = ''; let tripped = false; let ended = false; let lastId = null
-    ur.on('data', (chunk) => {
-      if (tripped) return
-      buf += chunk.toString('utf8')
-      let nl
-      while ((nl = buf.indexOf('\n\n')) >= 0) {
-        const evt = buf.slice(0, nl + 2); buf = buf.slice(nl + 2)
-        const line = evt.trim()
-        if (line.startsWith('data:') && !line.endsWith('[DONE]')) {
-          try {
-            const d = JSON.parse(line.slice(5))
+    if (!sse) { res.writeHead(ur.statusCode || 502, out); ur.pipe(res); return }
+    const encoding = String(ur.headers['content-encoding'] || 'identity').trim().toLowerCase()
+    if (encoding !== 'identity') {
+      sendJson(res, 502, { error: { message: 'guarded SSE requires an identity-encoded upstream response' } })
+      ur.destroy(); up.destroy()
+      return
+    }
+    // Framing normalization and a cap cut can both change the response length.
+    delete out['content-length']
+    const seen = new Set(); let lastId = null
+    const startResponse = () => { if (!res.headersSent) res.writeHead(ur.statusCode || 502, out) }
+    const relay = async () => {
+      try {
+        for await (const frame of sseEvents(ur)) {
+          if (res.destroyed) return
+          if (frame.data && frame.data !== '[DONE]') {
+            const d = JSON.parse(frame.data)
             lastId = d.id || lastId
             for (const c of d.choices || []) for (const tc of (c.delta && c.delta.tool_calls) || []) seen.add(tc.index)
-          } catch (e) {}
+          }
+          startResponse()
+          if (seen.size > toolCap) {
+            log(`${route.upstream}: tool-call storm guard tripped at ${seen.size} calls; cutting the response`)
+            const fin = { id: lastId || 'guard', object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: 'mimo-v2.6-flash', choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }
+            await writeSse(res, 'data: ' + JSON.stringify(fin) + '\n\ndata: [DONE]\n\n')
+            res.end(); up.destroy()
+            return
+          }
+          if (!await writeSse(res, frame.raw)) return
         }
-        if (seen.size > toolCap) {
-          tripped = true
-          log(`${route.upstream}: tool-call storm guard tripped at ${seen.size} calls; cutting the response`)
-          const fin = { id: lastId || 'guard', object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: 'mimo-v2.6-flash', choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }
-          res.write('data: ' + JSON.stringify(fin) + '\n\ndata: [DONE]\n\n'); res.end(); ended = true
-          up.destroy()
-          return
-        }
-        res.write(evt)
+        startResponse(); res.end()
+      } catch (error) {
+        log(`upstream SSE rejected: ${error.message}`)
+        if (!res.headersSent) sendJson(res, 502, { error: { message: 'invalid or incomplete upstream SSE response' } })
+        else res.destroy()
+        ur.destroy(); up.destroy()
       }
-    })
-    ur.on('end', () => { if (!ended) { if (buf) res.write(buf); res.end() } })
+    }
+    relay()
   })
 
   up.on('error', (e) => {
