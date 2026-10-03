@@ -26,6 +26,8 @@
 // Routes:   http://127.0.0.1:8905/<route>/v1/...  ->  <upstream>/...
 // Limits:   routes.json beside this file. Measured, not guessed: each server was
 //           sent 9 images and named its own limit in the refusal.
+//           Route option imageCap: false skips image trimming for that route and
+//           streams the request body to the upstream instead of buffering it.
 // Health:   GET /health
 // Log:      proxy.log beside this file (trimmed requests, dropped upstreams, errors).
 
@@ -35,6 +37,7 @@ const http = require('http')
 const https = require('https')
 const fs = require('fs')
 const path = require('path')
+const { Transform } = require('stream')
 
 const HOST = '127.0.0.1' // loopback only; the harness is the only client
 const PORT = Number(process.env.IMAGE_CAP_PORT || 8905)
@@ -92,10 +95,15 @@ function capImages(messages, max) {
   return { total: refs.length, removed: excess }
 }
 
+// `body` is a Buffer, or a readable stream on imageCap: false routes.
 function forward(req, res, target, body, route = {}) {
+  const streamingBody = typeof body.pipe === 'function'
   const headers = { ...req.headers }
   for (const h of ['host', 'connection', 'keep-alive', 'transfer-encoding', 'content-length']) delete headers[h]
-  if (body.length || req.method === 'POST') headers['content-length'] = String(body.length)
+  if (streamingBody) {
+    // Unknown length (chunked upload): Node sends the upstream request chunked too.
+    if (req.headers['content-length'] !== undefined) headers['content-length'] = req.headers['content-length']
+  } else if (body.length || req.method === 'POST') headers['content-length'] = String(body.length)
 
   const lib = target.protocol === 'https:' ? https : http
   const up = lib.request({
@@ -109,6 +117,9 @@ function forward(req, res, target, body, route = {}) {
   }, (ur) => {
     const out = { ...ur.headers }
     for (const h of ['connection', 'keep-alive', 'transfer-encoding']) delete out[h]
+    // The upstream answered before the upload finished (a 4xx, say): close the
+    // client connection afterwards rather than leave the rest of the body unread.
+    if (streamingBody && !req.complete) out.connection = 'close'
     res.writeHead(ur.statusCode || 502, out)
     // An upstream that drops MID-RESPONSE (the tailnet going away does exactly
     // this) makes `ur` emit 'error'. pipe() does not forward it, and an
@@ -156,6 +167,7 @@ function forward(req, res, target, body, route = {}) {
   })
 
   up.on('error', (e) => {
+    if (res.writableEnded) return // already answered, e.g. the 413 for an oversize streamed body
     log(`upstream ${target.host} unreachable: ${e.message}`)
     if (!res.headersSent) sendJson(res, 502, { error: { message: `upstream ${target.host} unreachable: ${e.message}` } })
     else res.destroy()
@@ -164,7 +176,47 @@ function forward(req, res, target, body, route = {}) {
   res.on('close', () => { if (!res.writableFinished) up.destroy() })
   res.on('error', () => up.destroy())
 
-  up.end(body)
+  if (streamingBody) body.pipe(up)
+  else up.end(body)
+  return up
+}
+
+function rejectBody(req, res) {
+  if (res.headersSent) { req.destroy(); res.destroy(); return }
+  res.setHeader('connection', 'close')
+  res.once('finish', () => req.destroy())
+  sendJson(res, 413, { error: { message: 'request body too large for the image-cap proxy' } })
+}
+
+/**
+ * imageCap: false routes. The body goes to the upstream as it arrives, through a
+ * byte counter that enforces MAX_BODY, instead of being collected, parsed and
+ * re-serialized: memory per request stays at a few chunks however large the
+ * request (base64 images), and pipe() backpressure holds the client when the
+ * upstream reads slowly. The response side (tool-call cap) is unchanged.
+ */
+function forwardUnmodified(req, res, target, route) {
+  if (Number(req.headers['content-length']) > MAX_BODY) { rejectBody(req, res); return }
+  let size = 0
+  const limited = new Transform({
+    transform(chunk, encoding, done) {
+      size += chunk.length
+      if (size > MAX_BODY) done(new Error('request body limit exceeded'))
+      else done(null, chunk)
+    },
+  })
+  const up = forward(req, res, target, limited, route)
+  limited.on('error', () => {
+    req.unpipe(limited); limited.unpipe(up)
+    rejectBody(req, res)
+    up.destroy()
+  })
+  req.on('error', (e) => { log(`client dropped mid-request: ${e.message}`); limited.destroy(); up.destroy() })
+  // The harness hung up mid-upload: abort the upstream request too.
+  res.on('close', () => {
+    if (!req.complete) { req.unpipe(limited); limited.destroy(); up.destroy(); req.destroy() }
+  })
+  req.pipe(limited)
 }
 
 const server = http.createServer((req, res) => {
@@ -178,6 +230,7 @@ const server = http.createServer((req, res) => {
     return sendJson(res, 404, { error: { message: `unknown route ${req.url}; expected /<route>/v1/... with route one of: ${Object.keys(ROUTES).join(', ')}` } })
   }
   const target = new URL(route.upstream.replace(/\/+$/, '') + (m[2] || ''))
+  if (route.imageCap === false) { forwardUnmodified(req, res, target, route); return }
 
   const chunks = []
   let size = 0
@@ -229,7 +282,7 @@ process.on('uncaughtException', (e) => log(`uncaught (kept running): ${(e && e.s
 process.on('unhandledRejection', (e) => log(`unhandled rejection (kept running): ${(e && e.stack) || e}`))
 
 server.listen(PORT, HOST, () => {
-  const summary = Object.entries(ROUTES).map(([k, r]) => `${k}->${r.upstream} (max ${r.maxImages})`).join(', ')
+  const summary = Object.entries(ROUTES).map(([k, r]) => `${k}->${r.upstream} (${r.imageCap === false ? 'streamed, no image cap' : `max ${r.maxImages}`})`).join(', ')
   log(`listening on http://${HOST}:${PORT} (pid ${process.pid})  ${summary}`)
   console.log(`image-cap proxy on http://${HOST}:${PORT}\n  ${summary}`)
 })
