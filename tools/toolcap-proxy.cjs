@@ -66,6 +66,12 @@ function sendJson(res, status, obj) {
   res.end(body)
 }
 
+/** True if a stream event still has something to forward once over-cap tool calls are removed. */
+function hasPayload(d) {
+  return (d.choices || []).some((c) => c.delta && Object.entries(c.delta).some(([k, v]) =>
+    k === 'tool_calls' ? v.length > 0 : k !== 'role' && v !== null && v !== undefined && v !== ''))
+}
+
 /**
  * Keep the newest `max` image parts across all messages; replace the older
  * ones, in place, with a text note. Newest-first because the latest image is
@@ -139,16 +145,28 @@ function forward(req, res, target, body, route = {}) {
       while ((nl = buf.indexOf('\n\n')) >= 0) {
         const evt = buf.slice(0, nl + 2); buf = buf.slice(nl + 2)
         const line = evt.trim()
+        let d = null; const over = new Set()
         if (line.startsWith('data:') && !line.endsWith('[DONE]')) {
           try {
-            const d = JSON.parse(line.slice(5))
+            d = JSON.parse(line.slice(5))
             lastId = d.id || lastId
-            for (const c of d.choices || []) for (const tc of (c.delta && c.delta.tool_calls) || []) seen.add(tc.index)
+            // One event can carry several tool-call deltas: the end of one call and the
+            // start of the next, or a whole batch. Count them one at a time, so the calls
+            // inside the cap still reach the harness complete and only the rest is cut.
+            for (const c of d.choices || []) {
+              const calls = (c.delta && c.delta.tool_calls) || []
+              const kept = calls.filter((tc) => {
+                if (seen.has(tc.index) || seen.size < toolCap) { seen.add(tc.index); return true }
+                over.add(tc.index); return false
+              })
+              if (kept.length < calls.length) { c.delta.tool_calls = kept; c.finish_reason = null }
+            }
           } catch (e) {}
         }
-        if (seen.size > toolCap) {
+        if (over.size) {
           tripped = true
-          log(`${route.upstream}: tool-call storm guard tripped at ${seen.size} calls; cutting the response`)
+          log(`${route.upstream}: tool-call storm guard tripped at ${seen.size + over.size} calls; cutting the response`)
+          if (hasPayload(d)) res.write('data: ' + JSON.stringify(d) + '\n\n')
           const fin = { id: lastId || 'guard', object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: 'mimo-v2.6-flash', choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }
           res.write('data: ' + JSON.stringify(fin) + '\n\ndata: [DONE]\n\n'); res.end(); ended = true
           up.destroy()
